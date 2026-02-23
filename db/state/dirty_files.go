@@ -258,8 +258,15 @@ func (i *FilesItem) closeFilesAndRemove() {
 	}
 }
 
+var filterDirtyFilesReCache sync.Map // pattern string → *regexp.Regexp
+
 func filterDirtyFiles(fileNames []string, stepSize, stepsInFrozenFile uint64, filenameBase, ext string, logger log.Logger) (res []*FilesItem) {
-	re := regexp.MustCompile(`^v(\d+(?:\.\d+)?)-` + filenameBase + `\.(\d+)-(\d+)\.` + ext + `$`)
+	pattern := `^v(\d+(?:\.\d+)?)-` + filenameBase + `\.(\d+)-(\d+)\.` + ext + `$`
+	reVal, ok := filterDirtyFilesReCache.Load(pattern)
+	if !ok {
+		reVal, _ = filterDirtyFilesReCache.LoadOrStore(pattern, regexp.MustCompile(pattern))
+	}
+	re := reVal.(*regexp.Regexp)
 	var err error
 
 	for _, name := range fileNames {

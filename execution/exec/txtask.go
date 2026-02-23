@@ -699,8 +699,34 @@ type QueueWithRetry struct {
 	capacity int
 }
 
+var queuePool sync.Pool
+
 func NewQueueWithRetry(capacity int) *QueueWithRetry {
+	if v := queuePool.Get(); v != nil {
+		q := v.(*QueueWithRetry)
+		if q.capacity == capacity {
+			return q
+		}
+		queuePool.Put(q) // wrong capacity, return to pool for another caller
+	}
 	return &QueueWithRetry{newTasks: make(chan Task, capacity), capacity: capacity}
+}
+
+// Release drains the queue and returns it to the pool for reuse.
+// The channel is preserved (not closed), avoiding reallocation of the
+// 100K-element buffer on the next NewQueueWithRetry call.
+// Must be called only after all producers and consumers have stopped.
+func (q *QueueWithRetry) Release() {
+	q.lock.Lock()
+	// Drain channel.
+	for len(q.newTasks) > 0 {
+		<-q.newTasks
+	}
+	// Clear retry heap, keep backing array.
+	q.retires = q.retires[:0]
+	q.closed = false
+	q.lock.Unlock()
+	queuePool.Put(q)
 }
 
 func (q *QueueWithRetry) NewTasksLen() int {
