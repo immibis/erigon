@@ -563,6 +563,9 @@ func (pe *parallelExecutor) execLoop(ctx context.Context) (err error) {
 	applyTx := pe.applyTx
 	pe.RUnlock()
 
+	stallTimer := time.NewTimer(30 * time.Second)
+	defer stallTimer.Stop()
+
 	for {
 		err := func() error {
 			pe.Lock()
@@ -594,6 +597,7 @@ func (pe *parallelExecutor) execLoop(ctx context.Context) (err error) {
 			if err := pe.processRequest(ctx, exec); err != nil {
 				return err
 			}
+			stallTimer.Reset(30 * time.Second)
 			continue
 		case <-ctx.Done():
 			return ctx.Err()
@@ -601,6 +605,7 @@ func (pe *parallelExecutor) execLoop(ctx context.Context) (err error) {
 			if !ok {
 				return nil
 			}
+			stallTimer.Reset(30 * time.Second)
 			closed, err := pe.rws.Drain(ctx, nextResult)
 			if err != nil {
 				return err
@@ -608,6 +613,10 @@ func (pe *parallelExecutor) execLoop(ctx context.Context) (err error) {
 			if closed {
 				return nil
 			}
+		case <-stallTimer.C:
+			pe.dumpStallState()
+			stallTimer.Reset(30 * time.Second)
+			continue
 		}
 
 		blockResult, err := pe.processResults(ctx, applyTx)
@@ -944,6 +953,70 @@ func (pe *parallelExecutor) wait(ctx context.Context) error {
 			return nil
 		case err := <-doneCh:
 			return err
+		}
+	}
+}
+
+func (pe *parallelExecutor) dumpStallState() {
+	pe.RLock()
+	defer pe.RUnlock()
+
+	if len(pe.blockExecutors) == 0 {
+		pe.logger.Warn("[parallel-exec] execLoop stalled for 30s, no active blockExecutors",
+			"workerQueueLen", pe.in.Len(),
+			"resultsQueueLen", pe.rws.Len(),
+		)
+		return
+	}
+
+	for blockNum, be := range pe.blockExecutors {
+		maxValidated := be.validateTasks.maxComplete()
+		maxExecComplete := be.execTasks.maxComplete()
+
+		pe.logger.Warn("[parallel-exec] execLoop stalled for 30s — blockExecutor state",
+			"block", blockNum,
+			"totalTasks", len(be.tasks),
+			"maxValidated", maxValidated,
+			"maxExecComplete", maxExecComplete,
+			"execPending", fmt.Sprint(be.execTasks.pending),
+			"execInProgress", fmt.Sprint(be.execTasks.inProgress),
+			"execComplete", len(be.execTasks.complete),
+			"valPending", len(be.validateTasks.pending),
+			"valInProgress", len(be.validateTasks.inProgress),
+			"valComplete", len(be.validateTasks.complete),
+			"pubPending", len(be.publishTasks.pending),
+			"pubComplete", len(be.publishTasks.complete),
+			"workerQueueLen", pe.in.Len(),
+			"resultsQueueLen", pe.rws.Len(),
+		)
+
+		// Dump details for each pending exec task
+		for _, tx := range be.execTasks.pending {
+			if tx >= 0 && tx < len(be.tasks) {
+				blockers := be.execTasks.blocker[tx]
+				pe.logger.Warn("[parallel-exec] pending task detail",
+					"block", blockNum,
+					"taskIdx", tx,
+					"incarnation", be.txIncarnations[tx],
+					"aborted", be.execAborted[tx],
+					"failed", be.execFailed[tx],
+					"hasReads", be.blockIO.HasReads(be.tasks[tx].Version().TxIndex),
+					"blockedBy", fmt.Sprint(blockers),
+				)
+			}
+		}
+
+		// Also dump in-progress tasks that might be stuck
+		for _, tx := range be.execTasks.inProgress {
+			if tx >= 0 && tx < len(be.tasks) {
+				pe.logger.Warn("[parallel-exec] in-progress task detail",
+					"block", blockNum,
+					"taskIdx", tx,
+					"incarnation", be.txIncarnations[tx],
+					"aborted", be.execAborted[tx],
+					"failed", be.execFailed[tx],
+				)
+			}
 		}
 	}
 }
@@ -1748,6 +1821,7 @@ func (be *blockExecutor) scheduleExecution(ctx context.Context, pe *parallelExec
 	}
 
 	maxValidated := be.validateTasks.maxComplete()
+	var scheduled, skipped int
 	for i := 0; i < len(toExecute); i++ {
 		nextTx := toExecute[i]
 		execTask := be.tasks[nextTx]
@@ -1766,6 +1840,7 @@ func (be *blockExecutor) scheduleExecution(ctx context.Context, pe *parallelExec
 							return state.VersionInvalid
 						}, false, "") != state.VersionValid) {
 				be.execTasks.pushPending(nextTx)
+				skipped++
 				continue
 			}
 			be.cntSpecExec++
@@ -1776,6 +1851,7 @@ func (be *blockExecutor) scheduleExecution(ctx context.Context, pe *parallelExec
 		}
 
 		be.cntExec++
+		scheduled++
 
 		if incarnation := be.txIncarnations[nextTx]; incarnation == 0 {
 			pe.in.Add(ctx, &taskVersion{
@@ -1795,6 +1871,46 @@ func (be *blockExecutor) scheduleExecution(ctx context.Context, pe *parallelExec
 				profile:    be.profile,
 				stats:      be.stats,
 				statsMutex: &be.Mutex})
+		}
+	}
+
+	// Stall detector: all pending tasks were skipped, none sent to workers.
+	// This can cause a deadlock if no other results are expected to trigger
+	// another scheduleExecution call.
+	if scheduled == 0 && skipped > 0 {
+		maxExecComplete := be.execTasks.maxComplete()
+		pending := be.execTasks.pending
+		inProgress := be.execTasks.inProgress
+
+		pe.logger.Warn("[parallel-exec] STALL DETECTED: scheduleExecution skipped all pending tasks",
+			"block", be.blockNum,
+			"totalTasks", len(be.tasks),
+			"maxValidated", maxValidated,
+			"maxExecComplete", maxExecComplete,
+			"skippedCount", skipped,
+			"execPending", fmt.Sprint(pending),
+			"execInProgress", fmt.Sprint(inProgress),
+			"execComplete", len(be.execTasks.complete),
+			"valPending", len(be.validateTasks.pending),
+			"valInProgress", len(be.validateTasks.inProgress),
+			"valComplete", len(be.validateTasks.complete),
+			"pubPending", len(be.publishTasks.pending),
+			"pubComplete", len(be.publishTasks.complete),
+			"workerQueueLen", pe.in.Len(),
+		)
+
+		// Dump per-task details for all pending tasks
+		for _, tx := range pending {
+			blockers := be.execTasks.blocker[tx]
+			pe.logger.Warn("[parallel-exec] stalled task detail",
+				"block", be.blockNum,
+				"taskIdx", tx,
+				"incarnation", be.txIncarnations[tx],
+				"aborted", be.execAborted[tx],
+				"failed", be.execFailed[tx],
+				"hasReads", be.blockIO.HasReads(be.tasks[tx].Version().TxIndex),
+				"blockedBy", fmt.Sprint(blockers),
+			)
 		}
 	}
 }
