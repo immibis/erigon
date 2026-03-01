@@ -477,15 +477,17 @@ func New(tb testing.TB, opts ...Option) *ExecModuleTester {
 		// clean: only the truly deadlocked goroutines remain.
 		if t, ok := tb.(*testing.T); ok {
 			if deadline, ok := t.Deadline(); ok {
-				go func() {
-					timer := time.NewTimer(time.Until(deadline) - 5*time.Second)
-					defer timer.Stop()
-					select {
-					case <-timer.C:
-						ctxCancel()
-					case <-ctx.Done():
-					}
-				}()
+				if remaining := time.Until(deadline) - 5*time.Second; remaining > 0 {
+					go func() {
+						timer := time.NewTimer(remaining)
+						defer timer.Stop()
+						select {
+						case <-timer.C:
+							ctxCancel()
+						case <-ctx.Done():
+						}
+					}()
+				}
 			}
 		}
 	}
