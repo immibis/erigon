@@ -264,7 +264,8 @@ func filterDirtyFiles(fileNames []string, stepSize, stepsInFrozenFile uint64, fi
 	pattern := `^v(\d+(?:\.\d+)?)-` + filenameBase + `\.(\d+)-(\d+)\.` + ext + `$`
 	reVal, ok := filterDirtyFilesReCache.Load(pattern)
 	if !ok {
-		reVal, _ = filterDirtyFilesReCache.LoadOrStore(pattern, regexp.MustCompile(pattern))
+		re := regexp.MustCompile(pattern)
+		reVal, _ = filterDirtyFilesReCache.LoadOrStore(pattern, re)
 	}
 	re := reVal.(*regexp.Regexp)
 	var err error

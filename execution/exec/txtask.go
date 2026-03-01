@@ -704,10 +704,11 @@ var queuePool sync.Pool
 func NewQueueWithRetry(capacity int) *QueueWithRetry {
 	if v := queuePool.Get(); v != nil {
 		q := v.(*QueueWithRetry)
-		if q.capacity == capacity {
+		if q.capacity == capacity && q.newTasks != nil {
 			return q
 		}
-		queuePool.Put(q) // wrong capacity, return to pool for another caller
+		// If capacity is wrong or channel is nil, we don't put it back here;
+		// another Get() might return a valid one, or we'll allocate a new one.
 	}
 	return &QueueWithRetry{newTasks: make(chan Task, capacity), capacity: capacity}
 }
@@ -718,6 +719,10 @@ func NewQueueWithRetry(capacity int) *QueueWithRetry {
 // Must be called only after all producers and consumers have stopped.
 func (q *QueueWithRetry) Release() {
 	q.lock.Lock()
+	if q.newTasks == nil {
+		q.lock.Unlock()
+		return
+	}
 	// Drain channel.
 	for len(q.newTasks) > 0 {
 		<-q.newTasks
@@ -759,7 +764,7 @@ func (q *QueueWithRetry) Add(ctx context.Context, t Task) {
 	newTasks := q.newTasks
 	q.lock.Unlock()
 
-	if !closed {
+	if !closed && newTasks != nil {
 		select {
 		case <-ctx.Done():
 			return
@@ -773,12 +778,12 @@ func (q *QueueWithRetry) Add(ctx context.Context, t Task) {
 // No limit on amount of txs added by this method.
 func (q *QueueWithRetry) ReTry(t Task) {
 	q.lock.Lock()
-	if q.closed {
+	newTasks := q.newTasks
+	if q.closed || newTasks == nil {
 		q.lock.Unlock()
 		return
 	}
 	heap.Push(&q.retires, t)
-	newTasks := q.newTasks
 	q.lock.Unlock()
 	select {
 	case newTasks <- nil:
