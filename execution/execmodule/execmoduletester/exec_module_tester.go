@@ -470,6 +470,24 @@ func New(tb testing.TB, opts ...Option) *ExecModuleTester {
 			// Wait for all the background snapshot retirements launched by any stages2.StageLoopIteration to finish
 			mock.retirementWg.Wait()
 		})
+
+		// Cancel mock.Ctx before the test binary deadline so that background
+		// goroutines (sentry pump loops, exec workers) exit on their own even
+		// if the test function is stuck. This keeps the timeout goroutine dump
+		// clean: only the truly deadlocked goroutines remain.
+		if t, ok := tb.(*testing.T); ok {
+			if deadline, ok := t.Deadline(); ok {
+				go func() {
+					timer := time.NewTimer(time.Until(deadline) - 5*time.Second)
+					defer timer.Stop()
+					select {
+					case <-timer.C:
+						ctxCancel()
+					case <-ctx.Done():
+					}
+				}()
+			}
+		}
 	}
 
 	// Committed genesis will be shared between download and mock sentry

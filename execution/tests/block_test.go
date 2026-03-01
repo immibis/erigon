@@ -20,12 +20,9 @@
 package executiontests
 
 import (
-	"fmt"
-	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
-	"time"
 
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/execution/tests/testutil"
@@ -121,16 +118,10 @@ func TestExecutionSpecBlockchainDevnet(t *testing.T) {
 	bt.skipLoad(`^prague/eip7702_set_code_tx/test_set_code_to_sstore_then_sload.json`)
 
 	bt.walk(t, dir, func(t *testing.T, name string, test *testutil.BlockTest) {
-		before := runtime.NumGoroutine()
 		// import pre accounts & construct test genesis block & state root
 		test.ExperimentalBAL = true // TODO eventually remove this from BlockTest and run normally
 		if err := bt.checkFailure(t, test.Run(t)); err != nil {
 			t.Error(err)
-		}
-		time.Sleep(100 * time.Millisecond) // let goroutines wind down
-		after := runtime.NumGoroutine()
-		if delta := after - before; delta > 5 {
-			fmt.Fprintf(os.Stderr, "GOROUTINE LEAK: %s: before=%d after=%d delta=+%d\n", name, before, after, delta)
 		}
 	})
 }
