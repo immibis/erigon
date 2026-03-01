@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -148,9 +149,26 @@ type ExecModuleTester struct {
 
 func (emt *ExecModuleTester) Close() {
 	emt.cancel()
-	if err := emt.bgComponentsEg.Wait(); err != nil {
-		require.Equal(emt.tb, context.Canceled, err) // upon waiting for clean exit we should get ctx cancelled
+
+	done := make(chan error, 1)
+	go func() {
+		done <- emt.bgComponentsEg.Wait()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			require.Equal(emt.tb, context.Canceled, err) // upon waiting for clean exit we should get ctx cancelled
+		}
+	case <-time.After(30 * time.Second):
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		fmt.Fprintf(os.Stderr, "\n=== ExecModuleTester.Close() hung for 30s ===\nAll goroutines (%d bytes):\n%s\n=== END goroutine dump ===\n", n, buf[:n])
+		if err := <-done; err != nil {
+			require.Equal(emt.tb, context.Canceled, err)
+		}
 	}
+
 	if emt.Engine != nil {
 		emt.Engine.Close()
 	}
