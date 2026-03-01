@@ -1839,6 +1839,11 @@ func (be *blockExecutor) scheduleExecution(ctx context.Context, pe *parallelExec
 							}
 							return state.VersionInvalid
 						}, false, "") != state.VersionValid) {
+				// Undo the takeNextPending → inProgress move: the task was
+				// not actually dispatched to a worker, so it must not remain
+				// in inProgress (phantom state) where it would block
+				// removeDependency from re-pushing it to pending later.
+				be.execTasks.clearInProgress(nextTx)
 				be.execTasks.pushPending(nextTx)
 				skipped++
 				continue
@@ -1874,43 +1879,43 @@ func (be *blockExecutor) scheduleExecution(ctx context.Context, pe *parallelExec
 		}
 	}
 
-	// Stall detector: all pending tasks were skipped, none sent to workers.
-	// This can cause a deadlock if no other results are expected to trigger
-	// another scheduleExecution call.
+	// Stall prevention: if all pending tasks were skipped by the speculative
+	// check and no tasks were sent to workers, force-schedule the first
+	// pending task to prevent deadlock. Re-executing a task is always correct
+	// — the spec check is purely an optimization to avoid wasted work.
+	// A wasted re-execution is infinitely better than a deadlock.
 	if scheduled == 0 && skipped > 0 {
 		maxExecComplete := be.execTasks.maxComplete()
-		pending := be.execTasks.pending
-		inProgress := be.execTasks.inProgress
 
-		pe.logger.Warn("[parallel-exec] STALL DETECTED: scheduleExecution skipped all pending tasks",
+		pe.logger.Warn("[parallel-exec] scheduleExecution skipped all pending tasks, force-scheduling",
 			"block", be.blockNum,
 			"totalTasks", len(be.tasks),
 			"maxValidated", maxValidated,
 			"maxExecComplete", maxExecComplete,
 			"skippedCount", skipped,
-			"execPending", fmt.Sprint(pending),
-			"execInProgress", fmt.Sprint(inProgress),
+			"execPending", fmt.Sprint(be.execTasks.pending),
+			"execInProgress", fmt.Sprint(be.execTasks.inProgress),
 			"execComplete", len(be.execTasks.complete),
-			"valPending", len(be.validateTasks.pending),
-			"valInProgress", len(be.validateTasks.inProgress),
 			"valComplete", len(be.validateTasks.complete),
-			"pubPending", len(be.publishTasks.pending),
-			"pubComplete", len(be.publishTasks.complete),
 			"workerQueueLen", pe.in.Len(),
 		)
 
-		// Dump per-task details for all pending tasks
-		for _, tx := range pending {
-			blockers := be.execTasks.blocker[tx]
-			pe.logger.Warn("[parallel-exec] stalled task detail",
-				"block", be.blockNum,
-				"taskIdx", tx,
-				"incarnation", be.txIncarnations[tx],
-				"aborted", be.execAborted[tx],
-				"failed", be.execFailed[tx],
-				"hasReads", be.blockIO.HasReads(be.tasks[tx].Version().TxIndex),
-				"blockedBy", fmt.Sprint(blockers),
-			)
+		// Force-schedule the first pending task.
+		nextTx := be.execTasks.takeNextPending()
+		if nextTx >= 0 {
+			execTask := be.tasks[nextTx]
+			be.skipCheck[nextTx] = true
+			be.cntExec++
+
+			version := execTask.Version()
+			version.Incarnation = be.txIncarnations[nextTx]
+			pe.in.ReTry(&taskVersion{
+				execTask:   execTask,
+				version:    version,
+				versionMap: be.versionMap,
+				profile:    be.profile,
+				stats:      be.stats,
+				statsMutex: &be.Mutex})
 		}
 	}
 }
