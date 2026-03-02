@@ -1904,7 +1904,10 @@ func (be *blockExecutor) scheduleExecution(ctx context.Context, pe *parallelExec
 		nextTx := be.execTasks.takeNextPending()
 		if nextTx >= 0 {
 			execTask := be.tasks[nextTx]
-			be.skipCheck[nextTx] = true
+			// Do NOT set skipCheck here — the task is not at the validation
+			// frontier (maxValidated+1), so its result must go through normal
+			// validation. Setting skipCheck would accept stale-state results
+			// and produce wrong trie roots.
 			be.cntExec++
 
 			version := execTask.Version()
